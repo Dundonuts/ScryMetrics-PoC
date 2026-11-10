@@ -2,7 +2,6 @@
 Course: Project and Portfolio IV (PP4)
 Student: Alec Duncan
 Project: ScryMetrics
-
 """
 
 import sys
@@ -10,7 +9,7 @@ import time
 import json
 import urllib.request
 import urllib.parse
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QStringListModel
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -25,11 +24,82 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
     QProgressBar,
+    QCompleter,
 )
 import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 
+class AutocompleteWorker(QThread):
+    """Fetches card name suggestions from Scryfall in the background."""
+    suggestions_ready = pyqtSignal(list)
+
+    def __init__(self, query: str):
+        super().__init__()
+        self.query = query
+
+    def run(self):
+        encoded = urllib.parse.quote(self.query.strip())
+        endpoint = f"https://api.scryfall.com/cards/autocomplete?q={encoded}"
+        headers = {
+            "User-Agent": "ScryMetrics-StoreTerminal/1.0",
+            "Accept": "application/json"
+        }
+
+        try:
+            req = urllib.request.Request(endpoint, headers=headers)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+                names = data.get("data", [])
+                self.suggestions_ready.emit(names)
+        except Exception:
+            self.suggestions_ready.emit([])
+
+
+class CardSearchInput(QLineEdit):
+    """Search input with automatic Scryfall autocomplete suggestions."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText("Start typing (e.g. Ragavan, Sol Ring)...")
+
+        # Autocomplete dropdown configuration
+        self.completer_model = QStringListModel()
+        self.completer = QCompleter(self.completer_model, self)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.completer.setMaxVisibleItems(8)
+        self.setCompleter(self.completer)
+
+        # 250ms debounce timer to prevent firing requests on every raw keystroke
+        self.debounce_timer = QTimer(self)
+        self.debounce_timer.setSingleShot(True)
+        self.debounce_timer.setInterval(250)
+        self.debounce_timer.timeout.connect(self.trigger_autocomplete_fetch)
+
+        self.textChanged.connect(self.on_text_changed)
+        self.worker = None
+
+    def on_text_changed(self, text: str):
+        if len(text.strip()) >= 2:
+            self.debounce_timer.start()
+        else:
+            self.debounce_timer.stop()
+            self.completer_model.setStringList([])
+
+    def trigger_autocomplete_fetch(self):
+        query = self.text().strip()
+        if len(query) < 2:
+            return
+
+        self.worker = AutocompleteWorker(query)
+        self.worker.suggestions_ready.connect(self.update_suggestions)
+        self.worker.start()
+
+    def update_suggestions(self, names: list):
+        self.completer_model.setStringList(names)
+        if names and self.hasFocus():
+            self.completer.complete()
 
 class ScryfallWorker(QThread):
     """Background worker thread to query Scryfall REST API safely."""
@@ -164,9 +234,12 @@ class ScryMetricsTerminal(QMainWindow):
         # Scryfall Search & Autofill
         api_header = QLabel("SCRYFALL LIVE SEARCH")
         api_header.setObjectName("labelMeta")
-        self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("e.g. Ragavan, Sheoldred...")
-        
+        # Replaced standard QLineEdit with the auto-completing CardSearchInput
+        self.search_box = CardSearchInput()
+
+# Pressing Enter directly triggers the search without having to click the button
+        self.search_box.returnPressed.connect(self.start_api_fetch)
+
         self.search_btn = QPushButton("Search & Autofill")
         self.search_btn.setObjectName("apiBtn")
         self.search_btn.clicked.connect(self.start_api_fetch)
