@@ -1,7 +1,13 @@
 """
 Course: Project and Portfolio IV (PP4)
 Student: Alec Duncan
-Project: ScryMetrics
+Project: ScryMetrics - Iteration 3 (UX & Polish Phase)
+
+Day 3 Focus (Final Polish):
+- Visual Grid UI Revamp: Transformed the variant list into an IconMode Grid.
+- UX Error Prevention: Auto-fill dropdown forces completion prefix to prevent 404s.
+- Async ThumbnailWorker progressively loads card art into the grid.
+- Collector Modifiers (Release Year, Promos) added to math engine.
 """
 
 import sys
@@ -36,15 +42,36 @@ class AutocompleteWorker(QThread):
     def __init__(self, query: str):
         super().__init__()
         self.query = query
+        
     def run(self):
-        encoded = urllib.parse.quote(self.query.strip())
-        url = f"https://api.scryfall.com/cards/autocomplete?q={encoded}"
+        # 1. Double check the query length just in case the timer glitched
+        query_clean = self.query.strip()
+        if len(query_clean) < 2:
+            self.suggestions_ready.emit([])
+            return
+            
+        # 2. Safely encode the URL parameter
+        params = urllib.parse.urlencode({'q': query_clean})
+        url = f"https://api.scryfall.com/cards/autocomplete?{params}"
+        
+        # 3. Explicitly tell Scryfall we expect JSON back
+        headers = {
+            "User-Agent": "ScryMetrics/3.0",
+            "Accept": "application/json"
+        }
+        
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ScryMetrics/3.0"})
+            # Print the exact URL so we can see what Scryfall is trying to process
+            print(f"DEBUG: Autocomplete fetching -> {url}") 
+            
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read().decode())
                 self.suggestions_ready.emit(data.get("data", []))
-        except Exception:
+                
+        except Exception as e:
+            # Now we will see the exact URL that caused the 400 Bad Request
+            print(f"Autocomplete Error: {e} | URL was: {url}") 
             self.suggestions_ready.emit([])
 
 class ScryfallPrintsWorker(QThread):
@@ -125,8 +152,21 @@ class CardSearchInput(QLineEdit):
         self.completer_model = QStringListModel()
         self.completer = QCompleter(self.completer_model, self)
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.completer.setFilterMode(Qt.MatchFlag.MatchStartsWith) 
         self.setCompleter(self.completer)
+
+        # FIX: Force the popup to use dark mode colors so it isn't invisible
+        self.completer.popup().setStyleSheet("""
+            QListView {
+                background-color: #161B22;
+                color: #FFFFFF;
+                border: 1px solid #30363D;
+                font-size: 14px;
+                outline: none;
+            }
+            QListView::item { padding: 8px; }
+            QListView::item:selected { background-color: #1F6FEB; color: white; }
+        """)
 
         self.completer.activated.connect(self.on_autofill_selected)
 
@@ -147,6 +187,7 @@ class CardSearchInput(QLineEdit):
         else:
             self.debounce_timer.stop()
             self.completer_model.setStringList([])
+            self.completer.popup().hide()
 
     def fetch(self):
         query = self.text().strip()
@@ -158,6 +199,9 @@ class CardSearchInput(QLineEdit):
 
     def update_suggestions(self, names: list):
         self.completer_model.setStringList(names)
+        # FIX: Explicitly re-link the model so PyQt6 recognizes the async update
+        self.completer.setModel(self.completer_model)
+        
         if names and self.hasFocus():
             self.completer.setCompletionPrefix(self.text())
             self.completer.complete()
