@@ -1,15 +1,15 @@
 """
 Course: Project and Portfolio IV (PP4)
 Student: Alec Duncan
-Project: ScryMetrics 
+Project: ScryMetrics
 """
 
 import sys
 import json
 import urllib.request
 import urllib.parse
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QStringListModel
-from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QStringListModel, QSize
+from PyQt6.QtGui import QPixmap, QImage, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -22,6 +22,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QFrame,
     QCompleter,
+    QListWidget,
+    QListWidgetItem,
+    QAbstractItemView
 )
 import numpy as np
 from sklearn.linear_model import LinearRegression
@@ -45,7 +48,6 @@ class AutocompleteWorker(QThread):
             self.suggestions_ready.emit([])
 
 class ScryfallPrintsWorker(QThread):
-    """Day 1 Extension: Fetches ALL printings of a card instead of just one."""
     prints_found = pyqtSignal(list)
     fetch_failed = pyqtSignal(str)
     
@@ -54,24 +56,27 @@ class ScryfallPrintsWorker(QThread):
         self.card_name = card_name
         
     def run(self):
-        exact_name = urllib.parse.quote(f'!\"{self.card_name.strip()}\"')
-        url = f"https://api.scryfall.com/cards/search?q={exact_name}&unique=prints"
+        query = f'!"{self.card_name.strip()}"'
+        params = urllib.parse.urlencode({'q': query, 'unique': 'prints'})
+        url = f"https://api.scryfall.com/cards/search?{params}"
+        
+        headers = {
+            "User-Agent": "ScryMetrics/3.0",
+            "Accept": "application/json"
+        }
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ScryMetrics/3.0"})
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = json.loads(response.read().decode())
                 self.prints_found.emit(data.get("data", []))
-        except Exception:
-            self.fetch_failed.emit("Card not found on Scryfall.")
+        except Exception as e:
+            self.fetch_failed.emit(f"API Error: {str(e)}")
 
 class ImageDownloadWorker(QThread):
-    """Day 1 UX Polish: Downloads card artwork asynchronously to prevent UI freeze."""
     image_ready = pyqtSignal(bytes)
-    
     def __init__(self, image_url: str):
         super().__init__()
         self.image_url = image_url
-        
     def run(self):
         try:
             req = urllib.request.Request(self.image_url, headers={"User-Agent": "ScryMetrics/3.0"})
@@ -80,18 +85,50 @@ class ImageDownloadWorker(QThread):
         except Exception:
             pass 
 
+class ThumbnailWorker(QThread):
+    thumbnail_ready = pyqtSignal(int, bytes)
+
+    def __init__(self, prints: list):
+        super().__init__()
+        self.prints = prints
+        self._is_running = True
+
+    def run(self):
+        for i, p in enumerate(self.prints):
+            if not self._is_running:
+                break
+            try:
+                img_url = p.get("image_uris", {}).get("small")
+                if not img_url:
+                    img_url = p.get("card_faces", [{}])[0].get("image_uris", {}).get("small", "")
+                
+                if img_url:
+                    req = urllib.request.Request(img_url, headers={"User-Agent": "ScryMetrics/3.0"})
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        self.thumbnail_ready.emit(i, response.read())
+            except Exception:
+                pass 
+                
+    def stop(self):
+        self._is_running = False
+
 
 # ---------------- CUSTOM WIDGETS ----------------
 
 class CardSearchInput(QLineEdit):
+    autofill_triggered = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setPlaceholderText("Start typing (e.g. Lightning Bolt)...")
+        self.setPlaceholderText("Start typing (e.g. Jin-Gitaxias)...")
+        
         self.completer_model = QStringListModel()
         self.completer = QCompleter(self.completer_model, self)
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.setCompleter(self.completer)
+
+        self.completer.activated.connect(self.on_autofill_selected)
 
         self.debounce_timer = QTimer(self)
         self.debounce_timer.setSingleShot(True)
@@ -100,14 +137,21 @@ class CardSearchInput(QLineEdit):
         self.textChanged.connect(self.on_text)
         self.worker = None
 
+    def on_autofill_selected(self, text: str):
+        self.setText(text)
+        self.autofill_triggered.emit()
+
     def on_text(self, text: str):
         if len(text.strip()) >= 2:
             self.debounce_timer.start()
         else:
+            self.debounce_timer.stop()
             self.completer_model.setStringList([])
 
     def fetch(self):
         query = self.text().strip()
+        if len(query) < 2:
+            return
         self.worker = AutocompleteWorker(query)
         self.worker.suggestions_ready.connect(self.update_suggestions)
         self.worker.start()
@@ -115,6 +159,7 @@ class CardSearchInput(QLineEdit):
     def update_suggestions(self, names: list):
         self.completer_model.setStringList(names)
         if names and self.hasFocus():
+            self.completer.setCompletionPrefix(self.text())
             self.completer.complete()
 
 
@@ -138,7 +183,7 @@ class ValuationEngine:
         self.model.fit(X_train, y_train)
 
     def predict_value(self, mana_cost: int, rarity_text: str):
-        valid_mana = max(0, min(16, int(mana_cost))) # Error Prevention
+        valid_mana = max(0, min(16, int(mana_cost))) 
         rarity_num = self.rarity_map.get(rarity_text.lower().replace(" rare", "").strip(), 2)
         est = max(0.50, float(self.model.predict(np.array([[valid_mana, rarity_num]]))[0]))
         return {"est": est}
@@ -148,9 +193,10 @@ class ScryMetricsTerminal(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ScryMetrics Terminal – Iteration 3 Polish")
-        self.resize(1180, 800)
+        self.resize(1250, 850)
         self.engine = ValuationEngine()
         self.prints_cache = []  
+        self.thumb_worker = None
 
         self.setup_ui()
         self.apply_dark_theme()
@@ -162,94 +208,213 @@ class ScryMetricsTerminal(QMainWindow):
         layout.setContentsMargins(22, 22, 22, 22)
         layout.setSpacing(20)
 
-        # ---- LEFT SIDEBAR ----
-        sidebar = QFrame()
-        sidebar.setObjectName("sideFrame")
-        sidebar.setFixedWidth(340)
-        side_layout = QVBoxLayout(sidebar)
-        side_layout.setSpacing(12)
+        # ---- LEFT SIDEBAR (INTAKE & VALUATION) ----
+        left_panel = QFrame()
+        left_panel.setObjectName("sideFrame")
+        left_panel.setFixedWidth(380)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setSpacing(12)
 
-        side_layout.addWidget(QLabel("RETAIL INTAKE", objectName="panelHeading"))
+        left_layout.addWidget(QLabel("1. SEARCH CARD NAME", objectName="panelHeading"))
 
         self.search_box = CardSearchInput()
         self.search_box.returnPressed.connect(self.start_search)
+        self.search_box.autofill_triggered.connect(self.start_search)
+        
         self.search_btn = QPushButton("Search Inventory", objectName="apiBtn")
         self.search_btn.clicked.connect(self.start_search)
         self.status_msg = QLabel("API Status: Ready", objectName="statusMeta")
         
-        side_layout.addWidget(self.search_box)
-        side_layout.addWidget(self.search_btn)
-        side_layout.addWidget(self.status_msg)
+        left_layout.addWidget(self.search_box)
+        left_layout.addWidget(self.search_btn)
+        left_layout.addWidget(self.status_msg)
 
-        # UI Extension: Edition and Finish Dropdowns
-        side_layout.addWidget(QLabel("Specific Edition", objectName="labelMeta"))
-        self.edition_picker = QComboBox()
-        side_layout.addWidget(self.edition_picker)
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("background-color: #30363D;")
+        left_layout.addWidget(line)
 
-        side_layout.addWidget(QLabel("Card Finish", objectName="labelMeta"))
-        self.finish_picker = QComboBox()
-        side_layout.addWidget(self.finish_picker)
-
-        # UX Extension: Card Artwork Display Placeholder
+        left_layout.addWidget(QLabel("3. VALUATION & FINISH", objectName="panelHeading"))
+        
         self.art_label = QLabel()
         self.art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.art_label.setObjectName("artCanvas")
         self.art_label.setFixedSize(280, 390)
-        self.art_label.setText("No artwork loaded")
-        side_layout.addWidget(self.art_label)
-
-        side_layout.addStretch()
-        layout.addWidget(sidebar)
-
-        # ---- RIGHT WORKSPACE ----
-        work_area = QWidget()
-        work_layout = QVBoxLayout(work_area)
-        work_layout.addWidget(QLabel("WORKSPACE / VALUATION TERMINAL", objectName="dimMeta"))
+        self.art_label.setText("Select a printing from the right list.")
         
+        img_layout = QHBoxLayout()
+        img_layout.addStretch()
+        img_layout.addWidget(self.art_label)
+        img_layout.addStretch()
+        left_layout.addLayout(img_layout)
+
+        left_layout.addWidget(QLabel("Card Finish", objectName="labelMeta"))
+        self.finish_picker = QComboBox()
+        self.finish_picker.currentIndexChanged.connect(self.recalculate)
+        self.finish_picker.setEnabled(False) 
+        left_layout.addWidget(self.finish_picker)
+
         self.price_card = QFrame(objectName="cardBox")
         pc_box = QVBoxLayout(self.price_card)
         self.active_card_label = QLabel("Active Card: None", objectName="cardHeading")
+        self.active_card_label.setWordWrap(True)
         self.price_text = QLabel("$0.00", objectName="heroNumber")
+        self.market_delta_label = QLabel("TCG Market: $--.-- (Delta: N/A)", objectName="marketBlue")
         
         pc_box.addWidget(self.active_card_label)
-        pc_box.addWidget(QLabel("PREDICTED BASE MARKET VALUE", objectName="labelMeta"))
+        pc_box.addWidget(QLabel("PREDICTED COLLECTOR MARKET VALUE", objectName="labelMeta"))
         pc_box.addWidget(self.price_text)
+        pc_box.addWidget(self.market_delta_label)
         
-        work_layout.addWidget(self.price_card)
-        work_layout.addStretch()
-        layout.addWidget(work_area)
+        left_layout.addWidget(self.price_card)
+        left_layout.addStretch()
+        layout.addWidget(left_panel)
+
+        # ---- RIGHT WORKSPACE (GRID VARIANT LIST) ----
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0,0,0,0)
+        
+        right_layout.addWidget(QLabel("2. SELECT SPECIFIC PRINTING", objectName="dimMeta"))
+        
+        self.variant_list = QListWidget()
+        self.variant_list.setObjectName("variantList")
+        self.variant_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.variant_list.currentRowChanged.connect(self.on_edition_changed)
+        
+        # Grid Setup
+        self.variant_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.variant_list.setIconSize(QSize(146, 204))  
+        self.variant_list.setGridSize(QSize(170, 260))  
+        self.variant_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.variant_list.setMovement(QListWidget.Movement.Static)
+        self.variant_list.setSpacing(10)
+        self.variant_list.setWordWrap(True)
+        
+        right_layout.addWidget(self.variant_list)
+        layout.addWidget(right_panel)
 
     def start_search(self):
         query = self.search_box.text().strip()
         if len(query) < 2: return
         self.status_msg.setText("API Status: Fetching variants...")
+        
+        if self.thumb_worker:
+            self.thumb_worker.stop()
+        
+        self.variant_list.blockSignals(True)
+        self.variant_list.clear()
+        self.variant_list.blockSignals(False)
+        
+        self.finish_picker.setEnabled(False)
+        
         self.prints_worker = ScryfallPrintsWorker(query)
         self.prints_worker.prints_found.connect(self.on_prints_found)
-        self.prints_worker.fetch_failed.connect(lambda e: self.status_msg.setText("API Status: Not found"))
+        self.prints_worker.fetch_failed.connect(lambda e: self.status_msg.setText(e))
         self.prints_worker.start()
 
     def on_prints_found(self, prints: list):
-        self.status_msg.setText(f"API Status: {len(prints)} printings found ✓")
+        self.status_msg.setText(f"API Status: {len(prints)} printings found. Loading art...")
         self.prints_cache = prints
-        self.edition_picker.clear()
         
-        # Populate the dropdown with all found sets
+        self.variant_list.blockSignals(True)
         for p in prints:
-            set_name = p.get("set_name", "Unknown")
             set_code = p.get("set", "???").upper()
-            display_name = f"{set_name} ({set_code})"
-            self.edition_picker.addItem(display_name)
+            year = p.get("released_at", "2024").split("-")[0]
+            col_num = p.get("collector_number", "0")
             
-        # Load the first image as a test
-        if prints:
-            self.active_card_label.setText(f"Active Card: {prints[0].get('name')}")
-            try:
-                img_url = prints[0]["image_uris"]["normal"]
-                self.art_worker = ImageDownloadWorker(img_url)
-                self.art_worker.image_ready.connect(self.render_artwork)
-                self.art_worker.start()
-            except KeyError:
-                pass
+            display_str = f"[{year}] {set_code} #{col_num}"
+            
+            item = QListWidgetItem(display_str)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.variant_list.addItem(item)
+            
+        self.variant_list.blockSignals(False)
+        
+        self.thumb_worker = ThumbnailWorker(prints)
+        self.thumb_worker.thumbnail_ready.connect(self.apply_thumbnail)
+        self.thumb_worker.start()
+
+    def apply_thumbnail(self, index: int, img_bytes: bytes):
+        img = QImage()
+        img.loadFromData(img_bytes)
+        pixmap = QPixmap.fromImage(img)
+        icon = QIcon(pixmap)
+        
+        item = self.variant_list.item(index)
+        if item:
+            item.setIcon(icon)
+
+    def on_edition_changed(self, index: int):
+        if index < 0 or index >= len(self.prints_cache): return
+        
+        card_data = self.prints_cache[index]
+        set_name = card_data.get("set_name", "Unknown Set")
+        self.active_card_label.setText(f"Active Card: {card_data.get('name')} ({set_name})")
+        
+        try:
+            img_url = card_data["image_uris"]["normal"]
+        except KeyError:
+            img_url = card_data.get("card_faces", [{}])[0].get("image_uris", {}).get("normal", "")
+            
+        if img_url:
+            self.art_worker = ImageDownloadWorker(img_url)
+            self.art_worker.image_ready.connect(self.render_artwork)
+            self.art_worker.start()
+
+        self.finish_picker.blockSignals(True)
+        self.finish_picker.clear()
+        for f in card_data.get("finishes", ["nonfoil"]):
+            self.finish_picker.addItem(f.capitalize())
+        self.finish_picker.blockSignals(False)
+        self.finish_picker.setEnabled(True) 
+        
+        self.recalculate()
+
+    def recalculate(self):
+        idx = self.variant_list.currentRow()
+        if idx < 0 or not self.prints_cache: return
+        
+        card_data = self.prints_cache[idx]
+        finish = self.finish_picker.currentText().lower()
+        prices = card_data.get("prices", {})
+        
+        mana_val = int(card_data.get("cmc", 0))
+        rarity_val = card_data.get("rarity", "rare").capitalize()
+        set_name = card_data.get("set_name", "")
+        
+        market_price = None
+        if finish == "foil" and prices.get("usd_foil"):
+            market_price = float(prices["usd_foil"])
+        elif finish == "etched" and prices.get("usd_etched"):
+            market_price = float(prices["usd_etched"])
+        elif finish == "nonfoil" and prices.get("usd"):
+            market_price = float(prices["usd"])
+
+        res = self.engine.predict_value(mana_val, rarity_val)
+        predicted = res["est"]
+        
+        release_year = int(card_data.get("released_at", "2024").split("-")[0])
+        frame_effects = card_data.get("frame_effects", [])
+
+        if release_year < 2000:
+            predicted *= 35.0  
+        if "secret lair" in set_name.lower() or "masterpiece" in set_name.lower():
+            predicted *= 15.0  
+        if "extendedart" in frame_effects or "showcase" in frame_effects:
+            predicted *= 2.5   
+            
+        if finish in ["foil", "etched"]:
+            predicted *= 1.35 
+            
+        self.price_text.setText(f"${predicted:.2f}")
+
+        if market_price:
+            delta = predicted - market_price
+            sign = "+" if delta > 0 else ""
+            self.market_delta_label.setText(f"{finish.capitalize()} TCG Market: ${market_price:.2f} (Delta: {sign}${delta:.2f})")
+        else:
+            self.market_delta_label.setText(f"{finish.capitalize()} TCG Market: N/A (No market data)")
 
     def render_artwork(self, img_bytes: bytes):
         img = QImage()
@@ -262,14 +427,40 @@ class ScryMetricsTerminal(QMainWindow):
             QMainWindow { background-color: #0E1117; }
             QLabel { color: #E6EDF3; font-family: 'Segoe UI', sans-serif; }
             #sideFrame { background-color: #161B22; border: 1px solid #30363D; border-radius: 8px; }
-            #panelHeading, #cardHeading { font-size: 15px; font-weight: bold; color: #FFFFFF; }
+            #panelHeading, #dimMeta { font-size: 13px; font-weight: bold; color: #58A6FF; text-transform: uppercase; margin-top: 5px; }
+            #cardHeading { font-size: 14px; font-weight: bold; color: #FFFFFF; }
             #labelMeta { font-size: 11px; font-weight: 600; color: #8B949E; text-transform: uppercase; }
-            #statusMeta, #dimMeta { font-size: 10px; color: #6E7681; }
-            #cardBox { background-color: #161B22; border: 1px solid #30363D; border-radius: 8px; padding: 18px; }
+            #statusMeta { font-size: 10px; color: #6E7681; }
+            #cardBox { background-color: #0D1117; border: 1px solid #30363D; border-radius: 8px; padding: 18px; margin-top: 10px; }
             #heroNumber { font-size: 48px; font-weight: bold; color: #38D39F; }
+            #marketBlue { font-size: 14px; font-weight: 600; color: #58A6FF; }
             #artCanvas { background-color: #0D1117; border: 1px solid #30363D; border-radius: 8px; }
+            
             QLineEdit, QComboBox { background-color: #0D1117; color: #FFFFFF; border: 1px solid #30363D; border-radius: 6px; padding: 8px; }
             QPushButton#apiBtn { background-color: #238636; color: #FFFFFF; font-weight: 600; padding: 8px; border-radius: 6px; }
+            
+            QListWidget#variantList { 
+                background-color: #0E1117; 
+                color: #8B949E; 
+                border: 1px solid #30363D; 
+                border-radius: 8px; 
+                padding: 15px;
+            }
+            QListWidget#variantList::item { 
+                background-color: #161B22;
+                border: 1px solid #30363D; 
+                border-radius: 8px; 
+                padding: 8px; 
+            }
+            QListWidget#variantList::item:hover { 
+                background-color: #21262D; 
+                border: 1px solid #8B949E;
+            }
+            QListWidget#variantList::item:selected { 
+                background-color: #1F6FEB; 
+                color: white; 
+                border: 2px solid #58A6FF;
+            }
         """)
 
 def main():
